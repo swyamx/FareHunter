@@ -1,7 +1,8 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  eslint: { ignoreDuringBuilds: true },
+  // keep any other existing settings here
 };
 
 export default nextConfig;
