@@ -9,31 +9,31 @@ const MAPBOX = process.env.NEXT_PUBLIC_MAPBOX_TOKEN!;
 const AUSTIN = { center: { lat: 30.2672, lng: -97.7431 } } as const;
 
 type LatLng = { lat: number; lng: number };
-type RouteGeo = { distance: number; duration: number; coords: [number, number][]; label: string; color: string; kind: 'regular' | 'alternate' };
+type RouteGeo = {
+  distance: number; duration: number; coords: [number, number][];
+  label: string; color: string; kind: 'regular' | 'alternate'
+};
 
 const DEG2RAD = Math.PI / 180;
 const EARTH_M = 6371000;
 const M_TO_FT = 3.28084;
 
-// ---------- tight tuning (strict pass) ----------
-const TAIL_FRACTION = 0.22;      // sample only last ~22% of each route
-const SAMPLE_COUNT = 16;         // candidate points per route tail
-const DIST_FACTOR = 0.88;        // candidate drive must be <= 88% baseline distance (>=12% shorter)
-const TIME_FACTOR = 0.88;        // candidate drive must be <= 88% baseline time (>=12% faster)
-const PCT_IMPROVE = 0.12;        // modeled fare must be >=12% cheaper than cheapest regular
-const ABS_IMPROVE_MIN = 1.75;    // AND by at least $1.75
-
-// ---------- relaxed pass (used only if strict yields too few) ----------
-const RELAX_DIST = 0.97;         // allow <= 97% of route distance (or equal-ish)
-const RELAX_TIME = 0.97;         // allow <= 97% of route time (or equal-ish)
-const MIN_SUGGESTIONS = 2;       // ensure at least this many suggestions overall
-const MAX_SUGGESTIONS = 4;       // cap total suggestions shown
-
+// ---------- tuning (strict pass) ----------
+const TAIL_FRACTION = 0.22;
+const SAMPLE_COUNT  = 16;
+const DIST_FACTOR   = 0.90;
+const TIME_FACTOR   = 0.90;
+const PRICE_IMPROVE = 0.08;
 const ALT_OVERLAP_TOL_M = 60;
-const ALT_MAX = 3;               // up to 3 alternates (map only)
-const REG_MAX = 2;               // up to 2 regulars (listed)
+const ALT_MAX = 3;
+const REG_MAX = 2;
 
-// ---------- icons & helpers ----------
+// ---------- fallback (lenient) ----------
+const LOOSE_DIST_FACTOR = 0.98;
+const LOOSE_TIME_FACTOR = 0.98;
+const LOOSE_PRICE_IMPROVE = 0.00;
+
+// ---------- icons ----------
 const labeledIcon = (bg: string, text: string) =>
   new DivIcon({
     className: 'custom-pin',
@@ -51,6 +51,7 @@ function FlyTo({ center }: { center: LatLng | null }) {
   return null;
 }
 
+// ---------- math helpers ----------
 function haversineMeters(a: LatLng, b: LatLng) {
   const dLat = (b.lat - a.lat) * DEG2RAD;
   const dLng = (b.lng - a.lng) * DEG2RAD;
@@ -64,27 +65,36 @@ const metersToMinWalk = (m: number, speedMps = 1.33) => Math.round(m / speedMps 
 function seededRand(seed: number) { const x = Math.sin(seed) * 10000; return x - Math.floor(x); }
 function estimateETAmin(pickup: LatLng, seed = Date.now() / 30000) { return Math.floor(2 + seededRand(seed + pickup.lat + pickup.lng) * 6); }
 
-// ---------- zone penalties ----------
-type Box = { minLat: number; maxLat: number; minLng: number; maxLng: number };
-const ZONES: { name: 'Downtown' | 'Airport'; box: Box; penaltyUSD: number }[] = [
-  { name: 'Downtown', box: { minLat: 30.260, maxLat: 30.275, minLng: -97.753, maxLng: -97.734 }, penaltyUSD: 0.75 },
-  { name: 'Airport',  box: { minLat: 30.187, maxLat: 30.217, minLng: -97.706, maxLng: -97.648 }, penaltyUSD: 1.25 },
-];
-function inBox(p: LatLng, b: Box) { return p.lat >= b.minLat && p.lat <= b.maxLat && p.lng >= b.minLng && p.lng <= b.maxLng; }
-function zonePenaltyUSD(p: LatLng) {
-  let sum = 0;
-  for (const z of ZONES) if (inBox(p, z.box)) sum += z.penaltyUSD;
-  return sum;
-}
-
-// ---------- price model with consistent surge ----------
-function modeledPriceUSD(distance_m: number, duration_s: number, surge = 1.0, penaltyUSD = 0) {
+// ---------- price model ----------
+function modeledPriceUSD(distance_m: number, duration_s: number) {
   const miles = distance_m / 1609.34;
   const mins = duration_s / 60;
   const base = 2.25, perMile = 1.50, perMin = 0.33, service = 1.2;
-  const est = (base + perMile * miles + perMin * mins + service) * surge + penaltyUSD;
+  const h = new Date().getHours();
+  const rush = (h >= 7 && h <= 9) || (h >= 16 && h <= 19);
+  const surge = rush ? 1.18 + seededRand(Math.floor(Date.now() / 60000)) * 0.35 : 1.0 + seededRand(Math.floor(Date.now() / 120000)) * 0.18;
+  const est = (base + perMile * miles + perMin * mins + service) * surge;
   const center = Math.max(5, est);
   return { low: Math.max(4.5, center * 0.9), high: center * 1.12, center };
+}
+function priceLowerApprox(q?: { low?: number; center?: number }) {
+  if (!q) return '≈ —';
+  const v = (q.low ?? q.center);
+  return isFinite(v as number) ? `≈ $${(v as number).toFixed(2)}` : '≈ —';
+}
+function priceUpperApprox(q?: { high?: number; center?: number }) {
+  if (!q) return '≈ —';
+  const v = (q.high ?? q.center);
+  return isFinite(v as number) ? `≈ $${(v as number).toFixed(2)}` : '≈ —';
+}
+function savingsLowFirst(
+  candidate: { center?: number; low?: number },
+  base?: { center?: number; low?: number }
+) {
+  const baseVal = (base?.low ?? base?.center ?? 0);
+  const candVal = (candidate.low ?? candidate.center ?? 0);
+  if (!baseVal || !candVal) return null;
+  return Math.max(0, baseVal - candVal);
 }
 
 // ---------- Mapbox Directions ----------
@@ -109,8 +119,9 @@ async function mapboxDirections(
     coords: (rt.geometry?.coordinates ?? []) as [number, number][],
   })) as { distance: number; duration: number; coords: [number, number][] }[];
 }
-async function mapboxDrive(pu: LatLng, to: LatLng) {
-  const r = await mapboxDirections([pu, to], { profile: 'driving-traffic', alternatives: false });
+
+async function mapboxDrive(a: LatLng, b: LatLng) {
+  const r = await mapboxDirections([a, b], { profile: 'driving-traffic', alternatives: false });
   return r?.[0] ?? null;
 }
 async function mapboxWalk(a: LatLng, b: LatLng) {
@@ -118,7 +129,7 @@ async function mapboxWalk(a: LatLng, b: LatLng) {
   return r?.[0] ?? null;
 }
 
-// ---------- reverse geocode (short) ----------
+// ---------- reverse geocode ----------
 async function reverseShort(p: LatLng) {
   const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${p.lng},${p.lat}.json?access_token=${MAPBOX}&limit=1&types=address,poi`;
   const r = await fetch(url);
@@ -128,8 +139,8 @@ async function reverseShort(p: LatLng) {
   if (!f) return '';
   const place = String(f.place_name || '');
   const first = place.split(',')[0]?.trim();
-  if ((f.properties as any)?.address && !/\d/.test(first)) return `${first} · ${(f.properties as any).address}`;
-  return first || (f as any).text || place;
+  if (f.properties?.address && !/\d/.test(first)) return `${first} · ${f.properties.address}`;
+  return first || f.text || place;
 }
 
 // ---------- Foursquare (legacy v2 proxy) ----------
@@ -142,17 +153,11 @@ async function fsqSuggest(q: string, proximity?: LatLng) {
   return (j?.features || []) as { label: string; subtitle?: string; lat: number; lng: number }[];
 }
 
-// ---------- debounced ----------
+// ---------- small utils ----------
 function useDebounced<T>(value: T, delay = 250) {
   const [v, setV] = useState(value);
   useEffect(() => { const id = setTimeout(() => setV(value), delay); return () => clearTimeout(id); }, [value, delay]);
   return v;
-}
-function priceText(q?: { low?: number; high?: number; center?: number }) {
-  if (!q) return '…';
-  if (q.low && q.high) return `$${q.low.toFixed(2)} – $${q.high.toFixed(2)}`;
-  if (q.center) return `$${q.center.toFixed(2)}`;
-  return '—';
 }
 
 // ---------- route-tail sampling ----------
@@ -160,7 +165,7 @@ function sampleTail(coords: [number, number][], count = SAMPLE_COUNT, fraction =
   if (!coords.length) return [];
   const n = coords.length;
   const startIdx = Math.max(0, Math.floor(n * (1 - fraction)) - 1);
-  const slice = coords.slice(startIdx, n - 1);
+  const slice = coords.slice(startIdx, n - 1); // exclude exact final point
   const out: LatLng[] = [];
   for (let i = 1; i <= count; i++) {
     const t = i / (count + 1);
@@ -168,7 +173,7 @@ function sampleTail(coords: [number, number][], count = SAMPLE_COUNT, fraction =
     const [lng, lat] = slice[idx];
     out.push({ lat, lng });
   }
-  // dedupe close
+  // de-dupe close neighbors
   const uniq: LatLng[] = [];
   const seen = new Set<string>();
   for (const p of out) {
@@ -178,7 +183,7 @@ function sampleTail(coords: [number, number][], count = SAMPLE_COUNT, fraction =
   return uniq;
 }
 
-// ---------- geometry comparison (overlap %) ----------
+// ---------- geometry comparison ----------
 function pathOverlapPct(base: [number, number][], alt: [number, number][], tolM = ALT_OVERLAP_TOL_M) {
   if (!base.length || !alt.length) return 1;
   const step = Math.max(1, Math.floor(base.length / 200));
@@ -197,7 +202,7 @@ function pathOverlapPct(base: [number, number][], alt: [number, number][], tolM 
   return within / alt.length;
 }
 
-// ---------- synthesize alternates by forcing a VIA ----------
+// ---------- synthesize alternates ----------
 function bearingDeg(a: LatLng, b: LatLng) {
   const y = Math.sin((b.lng - a.lng) * DEG2RAD) * Math.cos(b.lat * DEG2RAD);
   const x = Math.cos(a.lat * DEG2RAD) * Math.sin(b.lat * DEG2RAD) -
@@ -206,23 +211,19 @@ function bearingDeg(a: LatLng, b: LatLng) {
   return (brng + 360) % 360;
 }
 function offsetPointMeters(p: LatLng, bearingDegCW: number, meters: number): LatLng {
-  const dByR = meters / EARTH_M;           // angular distance in radians
-  const br = bearingDegCW * DEG2RAD;       // bearing in radians
+  const dByR = meters / EARTH_M;
+  const br = bearingDegCW * DEG2RAD;
   const lat1 = p.lat * DEG2RAD;
   const lng1 = p.lng * DEG2RAD;
-
-  const lat2 = Math.asin(
-    Math.sin(lat1) * Math.cos(dByR) +
-    Math.cos(lat1) * Math.sin(dByR) * Math.cos(br)
-  );
-
-  const lng2 = lng1 + Math.atan2(
-    Math.sin(br) * Math.sin(dByR) * Math.cos(lat1),
-    Math.cos(dByR) - Math.sin(lat1) * Math.sin(lat2) // <-- fixed here
-  );
-
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(dByR) + Math.cos(lat1) * Math.sin(dByR) * Math.cos(br));
+  const lng2 = lng1 + Math.atan2(Math.sin(br) * Math.sin(dByR) * Math.cos(lat1), Math.cos(dByR) - Math.sin(lat1) * Math.sin(lat2));
   return { lat: lat2 / DEG2RAD, lng: lng2 / DEG2RAD };
 }
+
+// ---------- colors ----------
+const REG_COLORS = ['#60a5fa', '#a78bfa'];
+const ALT_COLORS = ['#34d399', '#f59e0b', '#ef4444'];
+const CAND_COLORS = ['#f59e0b', '#34d399', '#ef4444', '#22d3ee', '#eab308'];
 
 // ---------- AddressInput ----------
 function AddressInput({
@@ -277,90 +278,6 @@ function AddressInput({
   );
 }
 
-// ---------- colors ----------
-const REG_COLORS = ['#60a5fa', '#a78bfa'];             // Regular A/B
-const ALT_COLORS = ['#34d399', '#f59e0b', '#ef4444'];  // Alternate 1–3
-
-// ---------- CandidateCard ----------
-function CandidateCard({
-  idx, pickup, candidate, baseForRouteLabel, baseForRoute,
-}: {
-  idx: number;
-  pickup: LatLng;
-  candidate: {
-    drop: LatLng;
-    walkMin: number;
-    drive: { distance_m: number; duration_s: number };
-    routeIdx: string;
-    surge: number;
-    reason: 'strict' | 'fallback';
-  };
-  baseForRouteLabel: string;
-  baseForRoute?: RouteGeo;
-}) {
-  const [addr, setAddr] = useState<string>('…');
-  useEffect(() => { (async () => { const s = await reverseShort(candidate.drop); if (s) setAddr(s); })(); }, [candidate.drop.lat, candidate.drop.lng]);
-
-  const penalty = zonePenaltyUSD(candidate.drop);
-  const price = modeledPriceUSD(candidate.drive.distance_m, candidate.drive.duration_s, candidate.surge, penalty);
-  const basePrice = baseForRoute ? modeledPriceUSD(baseForRoute.distance, baseForRoute.duration, candidate.surge, zonePenaltyUSD({ lat: baseForRoute.coords.at(-1)?.[1] ?? 0, lng: baseForRoute.coords.at(-1)?.[0] ?? 0 })) : undefined;
-  const saved = (() => {
-    const baseVal = basePrice?.center ?? 0;
-    const candVal = price.center;
-    return baseVal > 0 ? Math.max(0, baseVal - candVal) : null;
-  })();
-  const walkFt = metersToFeet((candidate.walkMin * 60) * 1.33);
-
-  function uberLink(pu: LatLng, to: LatLng, nickname?: string) {
-    const qs = new URLSearchParams({
-      action: 'setPickup',
-      'pickup[latitude]': String(pu.lat),
-      'pickup[longitude]': String(pu.lng),
-      'dropoff[latitude]': String(to.lat),
-      'dropoff[longitude]': String(to.lng),
-    });
-    if (nickname) qs.set('dropoff[nickname]', nickname);
-    return `https://m.uber.com/ul/?${qs.toString()}`;
-  }
-
-  return (
-    <div className="rounded-2xl p-4 bg-zinc-900/60 border border-zinc-800 hover:border-zinc-600">
-      <div className="flex items-center justify-between mb-1">
-        <div className="text-xs text-zinc-400">{baseForRouteLabel.toUpperCase()}</div>
-        <span className={`text-[10px] px-2 py-0.5 rounded-full border ${candidate.reason === 'strict' ? 'border-emerald-600 text-emerald-300 bg-emerald-500/15' : 'border-zinc-600 text-zinc-300 bg-zinc-500/10'}`}>
-          {candidate.reason === 'strict' ? 'Strict' : 'Fallback'}
-        </span>
-      </div>
-      <div className="flex items-baseline justify-between">
-        <div className="text-2xl font-semibold">{priceText(price)}</div>
-        <div className="text-xs text-zinc-400">#{idx + 1}</div>
-      </div>
-      <div className="mt-1 flex items-center gap-2 text-sm text-zinc-300">
-        <span>Exact drop-off:</span>
-        <span className="font-medium">{addr}</span>
-        <button className="text-xs px-2 py-0.5 rounded border border-zinc-700 hover:bg-zinc-800"
-                onClick={() => navigator.clipboard.writeText(addr)}>Copy address</button>
-      </div>
-      <div className="mt-1 text-sm text-zinc-300">
-        Walk to final: <span className="font-medium">~{candidate.walkMin} min</span> ({walkFt.toLocaleString()} ft)
-      </div>
-      <div className="mt-3 flex gap-2">
-        <a href={uberLink(pickup, candidate.drop, addr)} target="_blank" rel="noreferrer"
-           className="px-3 py-2 rounded-xl bg-emerald-400 text-zinc-950 font-semibold hover:bg-emerald-300">Open in Uber</a>
-        <button className="px-3 py-2 rounded-xl border border-zinc-700 hover:bg-zinc-800"
-                onClick={() => navigator.clipboard.writeText(`${candidate.drop.lat.toFixed(6)}, ${candidate.drop.lng.toFixed(6)}`)}>
-          Copy coords
-        </button>
-      </div>
-      {saved !== null && (
-        <div className={`mt-2 inline-block text-[11px] px-2 py-0.5 rounded-full ${saved > 0 ? 'bg-emerald-500/15 border-emerald-600 text-emerald-300' : 'bg-zinc-500/10 border-zinc-600 text-zinc-300'} border`}>
-          {saved > 0 ? `Save ~$${saved.toFixed(2)}` : 'Similar price'}
-        </div>
-      )}
-    </div>
-  );
-}
-
 export default function Page() {
   const [pickupAddr, setPickupAddr] = useState('Lark Austin');
   const [dropAddr, setDropAddr] = useState('UT Austin Main Building');
@@ -374,9 +291,6 @@ export default function Page() {
 
   const [showRegular, setShowRegular] = useState(true);
   const [showAlternates, setShowAlternates] = useState(true);
-
-  // surge proxy per search
-  const [surgeProxy, setSurgeProxy] = useState<number>(1.0);
 
   // quick resolve defaults
   useEffect(() => {
@@ -392,47 +306,68 @@ export default function Page() {
     })();
   }, []); // eslint-disable-line
 
-  // build routes (regular + alternates; alternates are drawn on map but not listed)
+  // build routes
   useEffect(() => {
     let alive = true;
     (async () => {
       if (!pickup || !drop) return;
 
-      // traffic-aware routes
-      const routesTraffic = await mapboxDirections([pickup, drop], { profile: 'driving-traffic', alternatives: true });
-      if (!routesTraffic || routesTraffic.length === 0) { setRegularRoutes([]); setAltRoutes([]); return; }
-      routesTraffic.sort((a, b) => a.duration - b.duration);
+      const routes = await mapboxDirections([pickup, drop], { profile: 'driving-traffic', alternatives: true });
+      if (!routes || routes.length === 0) { setRegularRoutes([]); setAltRoutes([]); return; }
 
-      // compute free-flow to derive surge proxy (use fastest traffic route)
-      let surge = 1.0;
-      try {
-        const fastest = routesTraffic[0];
-        const free = await mapboxDirections([pickup, drop], { profile: 'driving', alternatives: false });
-        const freeDur = free?.[0]?.duration ?? fastest.duration;
-        const ratio = Math.max(1.0, Math.min(1.3, fastest.duration / Math.max(1, freeDur)));
-        surge = ratio;
-      } catch { /* keep 1.0 */ }
-      if (alive) setSurgeProxy(surge);
+      routes.sort((a, b) => a.duration - b.duration);
 
-      // regular A/B
-      const regs: RouteGeo[] = routesTraffic.slice(0, REG_MAX).map((r, i) => ({
+      const regs: RouteGeo[] = routes.slice(0, REG_MAX).map((r, i) => ({
         ...r,
         label: `Regular ${String.fromCharCode(65 + i)}`,
         color: REG_COLORS[i % REG_COLORS.length],
         kind: 'regular'
       }));
 
-      // alternates directly from Mapbox beyond regs (map only)
-      const altsFromAPI: RouteGeo[] = routesTraffic.slice(REG_MAX, REG_MAX + ALT_MAX).map((r, i) => ({
+      let alts: RouteGeo[] = routes.slice(REG_MAX).slice(0, ALT_MAX).map((r, i) => ({
         ...r,
         label: `Alternate ${i + 1}`,
         color: ALT_COLORS[i % ALT_COLORS.length],
         kind: 'alternate'
       }));
 
-      // (Optional) synthesize alternates if fewer than ALT_MAX… (kept from previous version)
-      let alts: RouteGeo[] = [...altsFromAPI];
-      // — trimmed to keep the file focused; you can keep your prior synthesis block if you want more alternates —
+      const need = ALT_MAX - alts.length;
+      if (need > 0 && regs.length > 0) {
+        const base = regs[0];
+        const coords = base.coords;
+        const n = coords.length;
+        const picks = [Math.floor(n * 0.6), Math.floor(n * 0.75)];
+        const offsets = [350, -350, 600];
+        for (let pi = 0; pi < picks.length && alts.length < ALT_MAX; pi++) {
+          const idx = Math.min(n - 2, Math.max(1, picks[pi]));
+          const p1 = { lng: coords[idx - 1][0], lat: coords[idx - 1][1] };
+          const p2 = { lng: coords[idx][0], lat: coords[idx][1] };
+          const br = bearingDeg(p1, p2);
+          const perpL = (br + 270) % 360;
+          const perpR = (br + 90) % 360;
+          for (const off of offsets) {
+            const bearing = off < 0 ? perpL : perpR;
+            const via = offsetPointMeters({ lat: p2.lat, lng: p2.lng }, bearing, Math.abs(off));
+            const multi = await mapboxDirections([pickup, via, drop], { profile: 'driving-traffic', alternatives: false });
+            if (!multi || !multi[0]) continue;
+            const route = multi[0];
+
+            if (route.distance > base.distance * 1.6) continue;
+            const overlap = pathOverlapPct(base.coords, route.coords, ALT_OVERLAP_TOL_M);
+            if (overlap > 0.75) continue;
+            const dup = alts.some(a => pathOverlapPct(a.coords, route.coords, ALT_OVERLAP_TOL_M) > 0.85);
+            if (dup) continue;
+
+            alts.push({
+              ...route,
+              label: `Alternate ${alts.length + 1}`,
+              color: ALT_COLORS[alts.length % ALT_COLORS.length],
+              kind: 'alternate'
+            });
+            if (alts.length >= ALT_MAX) break;
+          }
+        }
+      }
 
       if (!alive) return;
       setRegularRoutes(regs);
@@ -446,23 +381,13 @@ export default function Page() {
     return () => { alive = false; };
   }, [pickup?.lat, pickup?.lng, drop?.lat, drop?.lng]); // eslint-disable-line
 
-  // cheapest regular route (for comparisons & “regular price”)
-  const cheapestRegular = useMemo(() => {
-    if (regularRoutes.length === 0) return null;
-    const best = [...regularRoutes].sort((a, b) => a.duration - b.duration)[0];
-    return best;
-  }, [regularRoutes]);
-
-  const regularPrice = useMemo(() => {
-    if (!cheapestRegular) return null;
-    const penalty = zonePenaltyUSD({ lat: cheapestRegular.coords.at(-1)?.[1] ?? 0, lng: cheapestRegular.coords.at(-1)?.[0] ?? 0 });
-    return modeledPriceUSD(cheapestRegular.distance, cheapestRegular.duration, surgeProxy, penalty);
-  }, [cheapestRegular, surgeProxy]);
-
-  // candidates (strictly inside radius, then relaxed fallback if needed)
+  // candidates from visible routes
   const [candidates, setCandidates] = useState<
-    { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string; surge: number; reason: 'strict' | 'fallback' }[]
+    { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string }[]
   >([]);
+
+  // cache for candidate addresses
+  const [addrCache, setAddrCache] = useState<Record<string, string>>({});
 
   useEffect(() => {
     let alive = true;
@@ -473,170 +398,93 @@ export default function Page() {
         ...(showRegular ? regularRoutes : []),
         ...(showAlternates ? altRoutes : []),
       ];
+      if (visible.length === 0) { setCandidates([]); return; }
 
-      const bestReg = [...regularRoutes].sort((a, b) => a.duration - b.duration)[0];
-      if (!bestReg) { setCandidates([]); return; }
-
-      const bestPenalty = zonePenaltyUSD({ lat: bestReg.coords.at(-1)?.[1] ?? 0, lng: bestReg.coords.at(-1)?.[0] ?? 0 });
-      const bestPrice = modeledPriceUSD(bestReg.distance, bestReg.duration, surgeProxy, bestPenalty).center;
-
-      const strictAll: { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string; surge: number; reason: 'strict' }[] = [];
-
-      // ---------- STRICT PASS ----------
-      for (const r of visible) {
-        const baseDist = r.distance, baseTime = r.duration;
-        const tailPts = sampleTail(r.coords, SAMPLE_COUNT, TAIL_FRACTION);
-
-        for (const p of tailPts) {
-          // HARD radius cap and avoid exact-final
-          const radial = haversineMeters(p, drop);
-          if (radial > radiusM || radial < 12) continue;
-
-          // walking feasibility
-          const wk = await mapboxWalk(p, drop);
-          const walkMin = wk ? Math.round(wk.duration / 60) : metersToMinWalk(radial);
-
-          // drive pickup -> candidate
-          const drv = await mapboxDrive(pickup, p);
-          if (!drv) continue;
-
-          // strictly shorter by time & distance vs THIS route
-          const distOK = drv.distance <= DIST_FACTOR * baseDist;
-          const timeOK = drv.duration <= TIME_FACTOR * baseTime;
-          if (!(distOK && timeOK)) continue;
-
-          // price improvement vs CHEAPEST regular
-          const candPenalty = zonePenaltyUSD(p);
-          const candPrice = modeledPriceUSD(drv.distance, drv.duration, surgeProxy, candPenalty).center;
-          const absImprove = bestPrice - candPrice;
-          const pctImprove = absImprove / bestPrice;
-
-          if (absImprove < ABS_IMPROVE_MIN) continue;
-          if (pctImprove < PCT_IMPROVE) continue;
-
-          strictAll.push({ drop: p, walkMin, drive: { distance_m: drv.distance, duration_s: drv.duration }, routeIdx: r.label, surge: surgeProxy, reason: 'strict' });
-        }
-      }
-
-      // sort strict by savings, then quality
-      strictAll.sort((a, b) => {
-        const aPrice = modeledPriceUSD(a.drive.distance_m, a.drive.duration_s, surgeProxy, zonePenaltyUSD(a.drop)).center;
-        const bPrice = modeledPriceUSD(b.drive.distance_m, b.drive.duration_s, surgeProxy, zonePenaltyUSD(b.drop)).center;
-        const aSave = bestPrice - aPrice;
-        const bSave = bestPrice - bPrice;
-        if (bSave !== aSave) return bSave - aSave;
-        return (a.drive.distance_m * 1.5 + a.drive.duration_s) - (b.drive.distance_m * 1.5 + b.drive.duration_s);
-      });
-
-      // cap strict: at most 2 per route & MAX_SUGGESTIONS total
-      const perRouteStrict: Record<string, number> = {};
-      const strictCapped: typeof strictAll = [];
-      for (const c of strictAll) {
-        perRouteStrict[c.routeIdx] = (perRouteStrict[c.routeIdx] ?? 0) + 1;
-        if (perRouteStrict[c.routeIdx] <= 2) strictCapped.push(c);
-        if (strictCapped.length >= MAX_SUGGESTIONS) break;
-      }
-
-      let results: { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string; surge: number; reason: 'strict' | 'fallback' }[] = [...strictCapped];
-
-      // ---------- RELAXED PASS (only if we need more) ----------
-      if (results.length < MIN_SUGGESTIONS) {
-        const relaxedAll: { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string; surge: number; reason: 'fallback' }[] = [];
+      const build = async (strict: boolean) => {
+        const all: { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string }[] = [];
 
         for (const r of visible) {
           const baseDist = r.distance, baseTime = r.duration;
           const tailPts = sampleTail(r.coords, SAMPLE_COUNT, TAIL_FRACTION);
 
           for (const p of tailPts) {
-            const radial = haversineMeters(p, drop);
-            if (radial > radiusM || radial < 12) continue;
+            if (haversineMeters(p, drop) < 12) continue;
 
             const wk = await mapboxWalk(p, drop);
-            const walkMin = wk ? Math.round(wk.duration / 60) : metersToMinWalk(radial);
+            const walkMin = wk ? Math.round(wk.duration / 60) : metersToMinWalk(haversineMeters(p, drop));
+            if (walkMin > metersToMinWalk(radiusM) + 1) continue;
 
             const drv = await mapboxDrive(pickup, p);
             if (!drv) continue;
 
-            // relaxed: must be at least *not worse* than route by small margin (<=97%)
-            const distOK = drv.distance <= RELAX_DIST * baseDist;
-            const timeOK = drv.duration <= RELAX_TIME * baseTime;
+            const distOK = drv.distance <= (strict ? DIST_FACTOR : LOOSE_DIST_FACTOR) * baseDist;
+            const timeOK = drv.duration <= (strict ? TIME_FACTOR : LOOSE_TIME_FACTOR) * baseTime;
             if (!(distOK && timeOK)) continue;
 
-            relaxedAll.push({ drop: p, walkMin, drive: { distance_m: drv.distance, duration_s: drv.duration }, routeIdx: r.label, surge: surgeProxy, reason: 'fallback' });
+            const baseModel = modeledPriceUSD(baseDist, baseTime).center;
+            const candModel = modeledPriceUSD(drv.distance, drv.duration).center;
+            const cheaper = (baseModel - candModel) / baseModel >= (strict ? PRICE_IMPROVE : LOOSE_PRICE_IMPROVE);
+            if (!cheaper) continue;
+
+            all.push({ drop: p, walkMin, drive: { distance_m: drv.distance, duration_s: drv.duration }, routeIdx: r.label });
           }
         }
 
-        // sort relaxed by modeled price (cheapest first)
-        relaxedAll.sort((a, b) => {
-          const ap = modeledPriceUSD(a.drive.distance_m, a.drive.duration_s, surgeProxy, zonePenaltyUSD(a.drop)).center;
-          const bp = modeledPriceUSD(b.drive.distance_m, b.drive.duration_s, surgeProxy, zonePenaltyUSD(b.drop)).center;
-          return ap - bp;
+        // sort by savings first, then by shown (lower) price
+        all.sort((a, b) => {
+          const aPrice = modeledPriceUSD(a.drive.distance_m, a.drive.duration_s);
+          const bPrice = modeledPriceUSD(b.drive.distance_m, b.drive.duration_s);
+          const aBase = visible.find(v => v.label === a.routeIdx);
+          const bBase = visible.find(v => v.label === b.routeIdx);
+          const aBasePrice = aBase ? modeledPriceUSD(aBase.distance, aBase.duration) : undefined;
+          const bBasePrice = bBase ? modeledPriceUSD(bBase.distance, bBase.duration) : undefined;
+          const aSaved = savingsLowFirst(aPrice, aBasePrice) ?? 0;
+          const bSaved = savingsLowFirst(bPrice, bBasePrice) ?? 0;
+          if (aSaved !== bSaved) return bSaved - aSaved;
+          const aShown = (aPrice.low ?? aPrice.center ?? Infinity);
+          const bShown = (bPrice.low ?? bPrice.center ?? Infinity);
+          return aShown - bShown;
         });
 
-        // de-dup vs strict, cap to fill MIN..MAX
-        const have = new Set(results.map(c => `${c.drop.lat.toFixed(6)},${c.drop.lng.toFixed(6)}`));
-        for (const c of relaxedAll) {
-          const key = `${c.drop.lat.toFixed(6)},${c.drop.lng.toFixed(6)}`;
-          if (have.has(key)) continue;
-          results.push(c);
-          have.add(key);
-          if (results.length >= Math.max(MIN_SUGGESTIONS, MAX_SUGGESTIONS)) break;
+        // cap: top 2 per route label
+        const perRoute: Record<string, number> = {};
+        const capped: typeof all = [];
+        for (const c of all) {
+          perRoute[c.routeIdx] = (perRoute[c.routeIdx] ?? 0) + 1;
+          if (perRoute[c.routeIdx] <= 2) capped.push(c);
         }
-      }
+        return capped;
+      };
 
-      // ---------- LAST-RESORT “closest tail pins” (inside radius) ----------
-      if (results.length < MIN_SUGGESTIONS) {
-        const closestAll: { drop: LatLng; walkMin: number; drive: { distance_m: number; duration_s: number }; routeIdx: string; surge: number; reason: 'fallback' }[] = [];
-        for (const r of visible) {
-          const tailPts = sampleTail(r.coords, SAMPLE_COUNT, TAIL_FRACTION);
-          for (const p of tailPts) {
-            const radial = haversineMeters(p, drop);
-            if (radial > radiusM || radial < 12) continue;
-            const wk = await mapboxWalk(p, drop);
-            const walkMin = wk ? Math.round(wk.duration / 60) : metersToMinWalk(radial);
-            const drv = await mapboxDrive(pickup, p);
-            if (!drv) continue;
-            closestAll.push({ drop: p, walkMin, drive: { distance_m: drv.distance, duration_s: drv.duration }, routeIdx: r.label, surge: surgeProxy, reason: 'fallback' });
-          }
+      let out = await build(true);
+      if (out.length === 0) out = await build(false);
+
+      if (!alive) return;
+      setCandidates(out);
+
+      // warm address cache
+      const updates: Record<string, string> = {};
+      await Promise.all(out.map(async (c) => {
+        const key = `${c.drop.lat.toFixed(6)},${c.drop.lng.toFixed(6)}`;
+        if (!addrCache[key]) {
+          const s = await reverseShort(c.drop);
+          if (s) updates[key] = s;
         }
-        // sort by radial distance (closest to final) then price
-        closestAll.sort((a, b) => {
-          const ra = haversineMeters(a.drop, drop!);
-          const rb = haversineMeters(b.drop, drop!);
-          if (ra !== rb) return ra - rb;
-          const ap = modeledPriceUSD(a.drive.distance_m, a.drive.duration_s, surgeProxy, zonePenaltyUSD(a.drop)).center;
-          const bp = modeledPriceUSD(b.drive.distance_m, b.drive.duration_s, surgeProxy, zonePenaltyUSD(b.drop)).center;
-          return ap - bp;
-        });
-
-        const have = new Set(results.map(c => `${c.drop.lat.toFixed(6)},${c.drop.lng.toFixed(6)}`));
-        for (const c of closestAll) {
-          const key = `${c.drop.lat.toFixed(6)},${c.drop.lng.toFixed(6)}`;
-          if (have.has(key)) continue;
-          results.push(c);
-          have.add(key);
-          if (results.length >= MIN_SUGGESTIONS) break;
-        }
-      }
-
-      // final hard cap
-      results = results.slice(0, MAX_SUGGESTIONS);
-
-      if (alive) setCandidates(results);
+      }));
+      if (alive && Object.keys(updates).length) setAddrCache(prev => ({ ...prev, ...updates }));
     })();
     return () => { alive = false; };
   }, [
     showRegular, showAlternates,
     regularRoutes.map(r => r.label).join('|'),
     altRoutes.map(r => r.label).join('|'),
-    pickup?.lat, pickup?.lng, drop?.lat, drop?.lng, radiusM, surgeProxy
+    pickup?.lat, pickup?.lng, drop?.lat, drop?.lng, radiusM
   ]); // eslint-disable-line
 
   // UI helpers
   const radiusFt = Math.round(radiusM * M_TO_FT);
   const maxWalkMin = metersToMinWalk(radiusM);
   const baselineETA = pickup ? estimateETAmin(pickup) : null;
-
   const mapCenter = drop || pickup || AUSTIN.center;
 
   function uberLink(pu: LatLng, to: LatLng, nickname?: string) {
@@ -651,13 +499,24 @@ export default function Page() {
     return `https://m.uber.com/ul/?${qs.toString()}`;
   }
 
+  const candidateLines = useMemo(() => {
+    if (!pickup) return [];
+    return candidates.slice(0, 8).map((c, i) => ({
+      key: `candline-${i}`,
+      color: CAND_COLORS[i % CAND_COLORS.length],
+      coords: [[pickup.lat, pickup.lng], [c.drop.lat, c.drop.lng]] as [number, number][],
+    }));
+  }, [pickup?.lat, pickup?.lng, candidates.map(c => `${c.drop.lat},${c.drop.lng}`).join('|')]); // eslint-disable-line
+
   return (
     <main className="min-h-screen w-full bg-zinc-950 text-zinc-100">
       <div className="max-w-6xl mx-auto px-4 py-8">
         <h1 className="text-3xl md:text-4xl font-semibold tracking-tight">Fare-Hunter</h1>
         <p className="text-zinc-300 mt-2">
-          Shows **1–2 regular routes** and up to **3 alternates** (map only). You’ll **always** get some suggestions inside your radius—
-          strict cheaper ones first, then clearly on-route fallback options if needed.
+          Drop off a short walk away and pay less. We map traffic-aware routes from your pickup to your destination,
+          then find drop-off points <b>along the route</b> that keep your walk under your limit and <b>shorten the actual drive</b>.
+          You’ll see your regular route price (conservatively shown with an upper estimate) and <b>cheaper</b> on-the-way options
+          (shown with their lower estimate) — plus how much you’d save.
         </p>
 
         {/* Inputs */}
@@ -700,7 +559,7 @@ export default function Page() {
               </label>
               <label className="flex items-center gap-2">
                 <input type="checkbox" checked={showAlternates} onChange={(e) => setShowAlternates(e.target.checked)} />
-                Show Alternates (map only)
+                Show Alternates
               </label>
             </div>
           </div>
@@ -722,13 +581,18 @@ export default function Page() {
                         pathOptions={{ color: r.color, weight: 5, opacity: 0.9 }} />
             ))}
 
-            {/* alternates on map only */}
+            {/* alternates (map only) */}
             {showAlternates && altRoutes.map((r, i) => (
               <Polyline key={`alt-${i}`} positions={r.coords.map(([lng, lat]) => [lat, lng]) as any}
                         pathOptions={{ color: r.color, weight: 4, opacity: 0.75, dashArray: '8 6' }} />
             ))}
 
-            {/* candidate pins (strict + fallback) */}
+            {/* candidate lines PU -> candidate */}
+            {candidateLines.map((ln) => (
+              <Polyline key={ln.key} positions={ln.coords} pathOptions={{ color: ln.color, weight: 2.5, opacity: 0.85, dashArray: '2 6' }} />
+            ))}
+
+            {/* candidate pins */}
             {candidates.map((c, idx) => (
               <Marker key={`cand-${idx}`} position={[c.drop.lat, c.drop.lng]} icon={labeledIcon('#f59e0b', `#${idx + 1}`)} />
             ))}
@@ -737,61 +601,101 @@ export default function Page() {
           </MapContainer>
         </div>
 
-        {/* Regular price (cheapest of regulars) */}
-        {pickup && drop && cheapestRegular && (
-          <div className="mt-6 rounded-2xl p-4 bg-zinc-900/60 border border-zinc-800">
+        {/* Regular routes card */}
+        <div className="mt-6">
+          <div className="rounded-2xl p-4 bg-zinc-900/60 border border-zinc-800">
             <div className="flex items-center justify-between">
-              <div className="text-lg font-semibold">Regular price (cheapest)</div>
-              {baselineETA !== null && (
-                <div className="text-sm text-zinc-400">ETA (mock): <span className="text-zinc-200 font-medium">{baselineETA} min</span></div>
-              )}
+              <h3 className="text-lg font-semibold">Regular routes</h3>
+              {baselineETA !== null && <div className="text-sm text-zinc-400">ETA (mock): {baselineETA} min</div>}
             </div>
-            <div className="mt-1 flex items-center gap-2 text-sm text-zinc-300">
-              <span>Exact drop-off:</span>
-              <span className="font-medium">{baselineAddr || dropAddr}</span>
-              <button
-                className="text-xs px-2 py-0.5 rounded border border-zinc-700 hover:bg-zinc-800"
-                onClick={() => navigator.clipboard.writeText(baselineAddr || dropAddr)}
-              >
-                Copy address
-              </button>
-            </div>
-            <div className="mt-1 text-2xl font-semibold">{priceText(regularPrice || undefined)}</div>
-            <div className="mt-3">
-              {pickup && drop && (
-                <a href={uberLink(pickup, drop)} target="_blank" rel="noreferrer" className="px-3 py-2 rounded-xl bg-emerald-400 text-zinc-950 font-semibold hover:bg-emerald-300">Open in Uber</a>
-              )}
-            </div>
-          </div>
-        )}
 
-        {/* Always-on suggestions (strict first, then fallback) */}
+            {regularRoutes.length === 0 && <div className="text-sm text-zinc-400 mt-2">No regular routes.</div>}
+            {regularRoutes.map((r, i) => {
+              const price = modeledPriceUSD(r.distance, r.duration);
+              return (
+                <div key={`regc-${i}`} className="mt-3 p-3 rounded-xl border border-zinc-800">
+                  <div className="text-sm font-medium" style={{ color: r.color }}>● {r.label}</div>
+                  <div className="text-xs text-zinc-400">{Math.round(r.duration/60)} min • {(r.distance/1609.34).toFixed(1)} mi</div>
+                  {/* REGULAR: show UPPER estimate with ≈ */}
+                  <div className="mt-1 text-2xl font-semibold">
+                    {priceUpperApprox(price)} <span className="text-sm font-normal text-zinc-400">(upper est.)</span>
+                  </div>
+                  <div className="mt-1 flex items-center gap-2 text-sm text-zinc-300">
+                    <span>Exact drop-off:</span>
+                    <span className="font-medium">{baselineAddr || dropAddr}</span>
+                    <button className="text-xs px-2 py-0.5 rounded border border-zinc-700 hover:bg-zinc-800"
+                            onClick={() => navigator.clipboard.writeText(baselineAddr || dropAddr)}>
+                      Copy address
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Cheaper along-route options */}
         <div className="mt-8">
-          <h3 className="text-lg font-semibold">On-the-way drop-offs inside your radius</h3>
-          {candidates.length === 0 && (
-            <div className="mt-2 text-sm text-zinc-400">
-              Still looking sparse. Try increasing the walk radius or nudging pickup/drop a little.
-            </div>
-          )}
+          <h3 className="text-lg font-semibold">Cheaper on-the-way drop-offs (by visible routes)</h3>
           <div className="mt-3 grid md:grid-cols-2 gap-4">
             {candidates.map((c, idx) => {
+              const price = modeledPriceUSD(c.drive.distance_m, c.drive.duration_s);
               const baseForRoute = [...regularRoutes, ...altRoutes].find(r => r.label === c.routeIdx);
+              const basePrice = baseForRoute ? modeledPriceUSD(baseForRoute.distance, baseForRoute.duration) : undefined;
+              const saved = savingsLowFirst(price, basePrice);
+              const key = `${c.drop.lat.toFixed(6)},${c.drop.lng.toFixed(6)}`;
+              const addr = addrCache[key] || '…';
+              const walkFt = metersToFeet((c.walkMin * 60) * 1.33);
+              const saveBadge = saved !== null && saved > 0;
+
               return (
-                <CandidateCard
-                  key={`candc-${idx}`}
-                  idx={idx}
-                  pickup={pickup!}
-                  candidate={c}
-                  baseForRouteLabel={c.routeIdx}
-                  baseForRoute={baseForRoute}
-                />
+                <div key={`candc-${idx}`} className="rounded-2xl p-4 bg-zinc-900/60 border border-zinc-800 hover:border-zinc-600">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      {/* ALTERNATE (suggestions): show LOWER estimate with ≈ */}
+                      <div className="text-2xl font-semibold">{priceLowerApprox(price)}</div>
+                    </div>
+                    {saveBadge ? (
+                      <div className="text-right">
+                        <div className="text-xl font-extrabold text-emerald-400">Save ${saved!.toFixed(2)}</div>
+                      </div>
+                    ) : (
+                      <div className="text-right text-[11px] text-zinc-500">No guaranteed savings</div>
+                    )}
+                  </div>
+
+                  <div className="mt-2 flex items-center gap-2 text-sm text-zinc-300">
+                    <span>Exact drop-off:</span>
+                    <span className="font-medium">{addr}</span>
+                    <button className="text-xs px-2 py-0.5 rounded border border-zinc-700 hover:bg-zinc-800"
+                            onClick={() => navigator.clipboard.writeText(addr)}>Copy address</button>
+                  </div>
+
+                  <div className="mt-1 text-sm text-zinc-300">
+                    Walk to final: <span className="font-medium">~{c.walkMin} min</span> ({walkFt.toLocaleString()} ft) •{' '}
+                    Drive vs route: <span className="font-medium">
+                      −{(((baseForRoute?.duration ?? 0) - c.drive.duration_s) / 60).toFixed(1)} min, −{((1 - c.drive.distance_m / (baseForRoute?.distance ?? 1)) * 100).toFixed(0)}%
+                    </span>
+                  </div>
+
+                  {pickup && (
+                    <div className="mt-3 flex gap-2">
+                      <a href={uberLink(pickup, c.drop, addr)} target="_blank" rel="noreferrer"
+                         className="px-3 py-2 rounded-xl bg-emerald-400 text-zinc-950 font-semibold hover:bg-emerald-300">Open in Uber</a>
+                      <button className="px-3 py-2 rounded-xl border border-zinc-700 hover:bg-zinc-800"
+                              onClick={() => navigator.clipboard.writeText(`${c.drop.lat.toFixed(6)}, ${c.drop.lng.toFixed(6)}`)}>
+                        Copy coords
+                      </button>
+                    </div>
+                  )}
+                </div>
               );
             })}
           </div>
 
           <div className="mt-4 text-xs text-zinc-500">
-            We first surface **clearly cheaper** (Strict) picks. If none qualify, we still show **on-route** (Fallback) pins inside your radius that are
-            near the destination and at least not worse than their route by a small margin.
+            We request Mapbox’s traffic-aware routes. If strict savings filters find nothing, we’ll still show close,
+            on-the-way options within your radius using a gentler pass so you always get suggestions.
           </div>
         </div>
       </div>
